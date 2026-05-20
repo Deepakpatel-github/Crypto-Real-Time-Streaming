@@ -3,7 +3,7 @@ import logging
 
 from confluent_kafka import Producer
 
-from config import settings
+from config.settings import settings
 
 
 logger = logging.getLogger(__name__)

@@ -1,9 +1,9 @@
 import asyncio
 import logging
 
-from ws_client import BinanceWSClient
-from kafka_publisher import KafkaPublisher
-from config import settings
+from producer.ws_client import BinanceWSClient
+from producer.kafka_publisher import KafkaPublisher
+from config.settings import settings
 
 
 logging.basicConfig(

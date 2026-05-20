@@ -3,7 +3,7 @@ import json
 import logging
 import websockets # type: ignore
 
-from config import settings
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
