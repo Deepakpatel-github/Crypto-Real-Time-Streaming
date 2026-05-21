@@ -36,9 +36,9 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_LOG_RETENTION_HOURS: 24
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 15s
@@ -65,17 +65,18 @@ services:
       context: ./flink
       dockerfile: Dockerfile
     container_name: flink-jobmanager
-    networks: [crypto-net]
     ports:
-      - "8081:8081"       # Flink Web UI
+      - "8081:8081"
     command: jobmanager
+    volumes:
+      - ../:/opt/project
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        parallelism.default: 2
-    volumes:
-      - ../flink_jobs:/opt/flink/jobs   # Mount your job code
+        rest.bind-port: 8081
+        python.executable: /usr/bin/python3
+    networks:
+      - crypto-net
 
   # ─── Flink TaskManager ─────────────────────────────────────────
   flink-taskmanager:
@@ -83,16 +84,18 @@ services:
       context: ./flink
       dockerfile: Dockerfile
     container_name: flink-taskmanager
-    networks: [crypto-net]
-    depends_on: [flink-jobmanager]
+    depends_on:
+      - flink-jobmanager
     command: taskmanager
+    volumes:
+      - ../:/opt/project
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
-        taskmanager.memory.process.size: 2048m
-    volumes:
-      - ../flink_jobs:/opt/flink/jobs
+        python.executable: /usr/bin/python3
+    networks:
+      - crypto-net
 
   # ─── ClickHouse ────────────────────────────────────────────────
   clickhouse:
@@ -108,9 +111,13 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-secret}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
+      - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 10
+  
+volumes:
+  clickhouse_data:

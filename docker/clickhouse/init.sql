@@ -1,23 +1,45 @@
--- This runs automatically when ClickHouse starts for the first time
-
 CREATE DATABASE IF NOT EXISTS crypto;
 
-CREATE TABLE IF NOT EXISTS crypto.market_events
+USE crypto;
+
+-- Final Persistent Table
+
+CREATE TABLE IF NOT EXISTS market_trades
 (
-    event_time      DateTime64(3),       -- millisecond precision
-    symbol          String,
-    price           Float64,
-    quantity        Float64,
-    trade_id        Int64,
-    is_buyer_maker  Bool,
-    window_start    Nullable(DateTime64(3)),
-    window_end      Nullable(DateTime64(3)),
-    avg_price       Nullable(Float64),
-    trade_count     Nullable(Int32),
-    is_anomaly      Bool DEFAULT false,
-    ingested_at     DateTime DEFAULT now()
+    symbol String,
+    avg_price Float64,
+    event_time UInt64,
+    trade_count UInt32,
+    created_at DateTime DEFAULT now()
 )
 ENGINE = MergeTree()
-PARTITION BY toYYYYMMDD(event_time)
-ORDER BY (symbol, event_time)
-TTL event_time + INTERVAL 7 DAY;   -- auto-purge after 7 days
+ORDER BY (symbol, event_time);
+
+-- Kafka Source Table
+
+CREATE TABLE IF NOT EXISTS kafka_market_trades
+(
+    symbol String,
+    avg_price Float64,
+    event_time UInt64,
+    trade_count UInt32
+)
+ENGINE = Kafka
+SETTINGS
+    kafka_broker_list = 'kafka:29092',
+    kafka_topic_list = 'processed_market_data',
+    kafka_group_name = 'clickhouse-consumer',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 1;
+
+-- Materialized View
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS market_trades_mv
+TO market_trades
+AS
+SELECT
+    symbol,
+    avg_price,
+    event_time,
+    trade_count
+FROM kafka_market_trades;
