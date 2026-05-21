@@ -111,9 +111,13 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-secret}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
+      - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 10
+  
+volumes:
+  clickhouse_data:
