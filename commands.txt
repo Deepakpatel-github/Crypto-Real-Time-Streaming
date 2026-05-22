@@ -1,0 +1,40 @@
+
+
+To run Producer :
+PS D:\crypto_streaming> python -m producer.main
+
+commands for Flink Job:
+
+- cd D:\crypto_streaming
+- docker compose up -d
+
+- docker exec -it flink-jobmanager bash
+- cd /opt/project
+
+This is important whenever code changes.
+- python -m zipfile -c project.zip config flink_jobs
+
+If project.zip already exists:
+- rm project.zip
+python -m zipfile -c project.zip config flink_jobs
+
+Submit Flink Job:
+flink run \
+  -py flink_jobs/market_data_job.py \
+  -pyfs project.zip
+
+Verify job is running:
+- flink list
+
+Flink UI : http://localhost:8081
+Kafka UI : http://localhost:8080
+
+
+ClickHouse Commands:
+
+- docker exec -it clickhouse bash
+- clickhouse-client
+
+- SHOW DATABASES;
+- USE crypto;
+- SHOW TABLES;

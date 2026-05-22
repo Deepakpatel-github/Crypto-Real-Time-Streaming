@@ -62,14 +62,12 @@ services:
   # ─── Flink JobManager ──────────────────────────────────────────
   flink-jobmanager:
     build:
-      context: ./flink
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/flink/Dockerfile
     container_name: flink-jobmanager
     ports:
       - "8081:8081"
     command: jobmanager
-    volumes:
-      - ../:/opt/project
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
@@ -81,14 +79,12 @@ services:
   # ─── Flink TaskManager ─────────────────────────────────────────
   flink-taskmanager:
     build:
-      context: ./flink
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/flink/Dockerfile
     container_name: flink-taskmanager
     depends_on:
       - flink-jobmanager
     command: taskmanager
-    volumes:
-      - ../:/opt/project
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager

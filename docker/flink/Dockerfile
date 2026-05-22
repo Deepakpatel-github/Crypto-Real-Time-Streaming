@@ -5,6 +5,7 @@ RUN apt-get update -y && \
         python3 \
         python3-pip \
         python3-dev \
+        zip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
@@ -13,8 +14,13 @@ RUN pip3 install \
     apache-flink==1.18.0 \
     python-dotenv
 
-# COPY local JARs — no wget needed
-COPY jars/flink-sql-connector-kafka-3.2.0-1.18.jar /opt/flink/lib/
-COPY jars/flink-json-1.18.1.jar /opt/flink/lib/
+# Copy connector jars
+COPY docker/flink/jars/flink-sql-connector-kafka-3.2.0-1.18.jar /opt/flink/lib/
 
+COPY docker/flink/jars/flink-json-1.18.1.jar /opt/flink/lib/
+
+# IMPORTANT
+COPY . /opt/project
+
+ENV PYTHONPATH=/opt/project
 ENV PYFLINK_PYTHON=/usr/bin/python3
