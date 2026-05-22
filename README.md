@@ -10,8 +10,6 @@
 
 **End-to-End Distributed Data Engineering Project**
 
-*Built by [Deepak Patel](https://github.com/deepakpatel)*
-
 </div>
 
 ---
