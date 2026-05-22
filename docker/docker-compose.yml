@@ -4,6 +4,17 @@ networks:
   crypto-net:
     driver: bridge
 
+x-flink-env: &flink-env
+  CLICKHOUSE_DB: crypto
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-secret}
+  CLICKHOUSE_PORT: "9000"
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+  FLINK_KAFKA_GROUP: flink-market-processor
+  FLINK_PARALLELISM: "2"
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  KAFKA_TOPIC: raw_trades
+
 services:
 
   # ─── Zookeeper (Kafka dependency) ──────────────────────────────
@@ -29,8 +40,8 @@ services:
       zookeeper:
         condition: service_healthy
     ports:
-      - "9092:9092"       # External access (your host machine)
-      - "29092:29092"     # Internal Docker network access
+      - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -59,6 +70,37 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
 
+  # ─── ClickHouse ────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse
+    networks: [crypto-net]
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: crypto
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-secret}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "clickhouse-client",
+          "--user",
+          "admin",
+          "--password",
+          "secret",
+          "--query",
+          "SELECT 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # ─── Flink JobManager ──────────────────────────────────────────
   flink-jobmanager:
     build:
@@ -67,15 +109,16 @@ services:
     container_name: flink-jobmanager
     networks: [crypto-net]
     ports:
-      - "8081:8081"       # Flink Web UI
+      - "8081:8081"
     command: jobmanager
     environment:
+      <<: *flink-env
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 2
     volumes:
-      - ../flink_jobs:/opt/flink/jobs   # Mount your job code
+      - ../flink_jobs:/opt/flink/jobs
 
   # ─── Flink TaskManager ─────────────────────────────────────────
   flink-taskmanager:
@@ -87,6 +130,7 @@ services:
     depends_on: [flink-jobmanager]
     command: taskmanager
     environment:
+      <<: *flink-env
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
@@ -94,23 +138,49 @@ services:
     volumes:
       - ../flink_jobs:/opt/flink/jobs
 
-  # ─── ClickHouse ────────────────────────────────────────────────
-  clickhouse:
-    image: clickhouse/clickhouse-server:24.3
-    container_name: clickhouse
+  # ─── Flink Job Submitter (one-shot) ────────────────────────────
+  flink-job-submitter:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: flink-job-submitter
     networks: [crypto-net]
-    ports:
-      - "8123:8123"       # HTTP interface
-      - "9000:9000"       # Native client interface
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
-      CLICKHOUSE_DB: crypto
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-secret}
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      <<: *flink-env
+      FLINK_JOBMANAGER_HOST: flink-jobmanager
+      FLINK_JOBMANAGER_PORT: "8081"
+      KAFKA_HOST: kafka
+      KAFKA_PORT: "29092"
+      MAX_WAIT_SECONDS: "180"
     volumes:
-      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+      - ../flink_jobs:/opt/flink/jobs
+    entrypoint: ["/bin/bash", "/opt/flink/jobs/submit_job.sh"]
+    restart: "no"
+
+  # ─── Binance WebSocket Producer ────────────────────────────────
+  producer:
+    build:
+      context: ../producer
+      dockerfile: Dockerfile
+    container_name: crypto-producer
+    networks: [crypto-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      BINANCE_WS_URL: wss://stream.binance.com:9443/stream
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw_trades
+      LOG_LEVEL: INFO
+    restart: unless-stopped
