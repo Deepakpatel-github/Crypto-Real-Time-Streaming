@@ -317,7 +317,7 @@ Stack must be up (`docker compose up -d` from `docker/`).
 
 ## Flink processing details
 
-- **Window**: 30-second tumbling event-time windows per `symbol`
+- **Window**: 30-second tumbling processing-time windows per `symbol`
 - **Metrics**: open/high/low/close, `avg_price`, `vwap`, `trade_count`, `total_volume`
 - **Moving average**: EMA across windows (`alpha = 0.3`) stored as `moving_avg_price`
 

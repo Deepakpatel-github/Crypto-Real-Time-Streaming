@@ -3,18 +3,12 @@ import os
 from datetime import datetime, timezone
 
 from clickhouse_driver import Client
-from pyflink.common import Duration, Time, Types, WatermarkStrategy
+from pyflink.common import Time, Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
-from pyflink.datastream.functions import (
-    MapFunction,
-    ProcessFunction,
-    ProcessWindowFunction,
-    SinkFunction,
-)
-from pyflink.datastream.timestamps import TimestampAssigner
-from pyflink.datastream.window import TumblingEventTimeWindows
+from pyflink.datastream.functions import MapFunction, ProcessWindowFunction
+from pyflink.datastream.window import TumblingProcessingTimeWindows
 
 EMA_ALPHA = 0.3
 WINDOW_SECONDS = 30
@@ -78,12 +72,6 @@ def _ms_to_datetime(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).replace(tzinfo=None)
 
 
-class TradeTimestampAssigner(TimestampAssigner):
-
-    def extract_timestamp(self, value, record_timestamp):
-        return value[5]
-
-
 class TradeParser(MapFunction):
 
     def map(self, value):
@@ -98,37 +86,49 @@ class TradeParser(MapFunction):
         )
 
 
-class RawClickHouseSink(SinkFunction):
+class RawClickHouseSink(MapFunction):
 
     def open(self, runtime_context):
         self._client = _clickhouse_client()
+        self._buffer = []
+        self._batch_size = 100
 
-    def invoke(self, value, context):
-        self._client.execute(
-            """
-            INSERT INTO raw_trades
-            (event_time, symbol, price, quantity, trade_id, is_buyer_maker)
-            VALUES
-            """,
-            [
-                (
-                    _ms_to_datetime(value[5]),
-                    value[0],
-                    value[1],
-                    value[2],
-                    value[3],
-                    value[4],
-                )
-            ],
+    def map(self, value):
+        self._buffer.append(
+            (
+                _ms_to_datetime(value[5]),
+                value[0],
+                value[1],
+                value[2],
+                value[3],
+                value[4],
+            )
         )
+        if len(self._buffer) >= self._batch_size:
+            self._flush()
+        return value
+
+    def _flush(self):
+        if not self._buffer:
+            return
+        self._client.execute(
+            "INSERT INTO raw_trades "
+            "(event_time, symbol, price, quantity, trade_id, is_buyer_maker) VALUES",
+            self._buffer,
+        )
+        self._buffer = []
+
+    def close(self):
+        self._flush()
+        self._client.disconnect()
 
 
 class TradeWindowAggregator(ProcessWindowFunction):
 
-    def process(self, key, context, elements, out):
+    def process(self, key, context, elements):
         trades = list(elements)
         if not trades:
-            return
+            return []
 
         prices = [trade[1] for trade in trades]
         quantities = [trade[2] for trade in trades]
@@ -137,7 +137,7 @@ class TradeWindowAggregator(ProcessWindowFunction):
         avg_price = sum(prices) / len(prices)
         vwap = price_volume / volume if volume > 0 else avg_price
 
-        out.collect(
+        return [
             (
                 key,
                 context.window().start,
@@ -151,39 +151,34 @@ class TradeWindowAggregator(ProcessWindowFunction):
                 len(trades),
                 volume,
             )
-        )
+        ]
 
 
-class MovingAverageEnricher(ProcessFunction):
+class MovingAverageEnricher(MapFunction):
 
     def open(self, runtime_context):
         self._ema_by_symbol = {}
 
-    def process_element(self, value, ctx, out):
+    def map(self, value):
         symbol = value[0]
         avg_price = value[7]
         previous_ema = self._ema_by_symbol.get(symbol, avg_price)
         moving_avg = (EMA_ALPHA * avg_price) + ((1 - EMA_ALPHA) * previous_ema)
         self._ema_by_symbol[symbol] = moving_avg
-        out.collect((*value, moving_avg))
+        return (*value, moving_avg)
 
 
-class ProcessedClickHouseSink(SinkFunction):
+class ProcessedClickHouseSink(MapFunction):
 
     def open(self, runtime_context):
         self._client = _clickhouse_client()
 
-    def invoke(self, value, context):
+    def map(self, value):
         self._client.execute(
-            """
-            INSERT INTO processed_market_data
-            (
-                window_start, window_end, symbol,
-                open_price, close_price, high_price, low_price,
-                avg_price, vwap, moving_avg_price, trade_count, total_volume
-            )
-            VALUES
-            """,
+            "INSERT INTO processed_market_data "
+            "(window_start, window_end, symbol, "
+            "open_price, close_price, high_price, low_price, "
+            "avg_price, vwap, moving_avg_price, trade_count, total_volume) VALUES",
             [
                 (
                     _ms_to_datetime(value[1]),
@@ -201,6 +196,10 @@ class ProcessedClickHouseSink(SinkFunction):
                 )
             ],
         )
+        return value
+
+    def close(self):
+        self._client.disconnect()
 
 
 def build_pipeline(env):
@@ -218,23 +217,21 @@ def build_pipeline(env):
         .build()
     )
 
-    watermark_strategy = WatermarkStrategy.for_bounded_out_of_orderness(
-        Duration.of_seconds(5)
-    ).with_timestamp_assigner(TradeTimestampAssigner())
-
     trades = (
-        env.from_source(kafka_source, watermark_strategy, "kafka_raw_trades")
+        env.from_source(
+            kafka_source, WatermarkStrategy.no_watermarks(), "kafka_raw_trades"
+        )
         .map(TradeParser(), output_type=TRADE_TYPE)
     )
 
-    trades.add_sink(RawClickHouseSink())
+    trades.map(RawClickHouseSink(), output_type=TRADE_TYPE)
 
     (
         trades.key_by(lambda trade: trade[0])
-        .window(TumblingEventTimeWindows.of(Time.seconds(WINDOW_SECONDS)))
+        .window(TumblingProcessingTimeWindows.of(Time.seconds(WINDOW_SECONDS)))
         .process(TradeWindowAggregator(), output_type=WINDOW_STATS_TYPE)
-        .process(MovingAverageEnricher(), output_type=ENRICHED_STATS_TYPE)
-        .add_sink(ProcessedClickHouseSink())
+        .map(MovingAverageEnricher(), output_type=ENRICHED_STATS_TYPE)
+        .map(ProcessedClickHouseSink(), output_type=ENRICHED_STATS_TYPE)
     )
 
 

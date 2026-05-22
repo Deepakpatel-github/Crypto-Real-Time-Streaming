@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS crypto.raw_trades
 ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(event_time)
 ORDER BY (symbol, event_time)
-TTL event_time + INTERVAL 7 DAY;
+TTL toDateTime(event_time) + INTERVAL 7 DAY;
 
 CREATE TABLE IF NOT EXISTS crypto.processed_market_data
 (
@@ -36,4 +36,4 @@ CREATE TABLE IF NOT EXISTS crypto.processed_market_data
 ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(window_start)
 ORDER BY (symbol, window_start)
-TTL window_start + INTERVAL 7 DAY;
+TTL toDateTime(window_start) + INTERVAL 7 DAY;
