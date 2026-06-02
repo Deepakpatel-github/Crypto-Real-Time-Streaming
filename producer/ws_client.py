@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 
 class BinanceWSClient:
 
+# The Trade Streams push raw trade information; each trade has a unique buyer and seller.
+# Stream Name: <symbol>@trade
     def __init__(self):
         self.streams = [
             "btcusdt@trade",
