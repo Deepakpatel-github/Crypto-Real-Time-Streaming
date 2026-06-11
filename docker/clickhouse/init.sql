@@ -31,9 +31,26 @@ CREATE TABLE IF NOT EXISTS crypto.processed_market_data
     moving_avg_price    Float64,
     trade_count         Int32,
     total_volume        Float64,
+    buy_volume        Float64,
+    sell_volume        Float64,
+    buy_sell_ratio        Float64,
+    trade_imbalance        Float64,
+    trade_frequency        Float64,
     processed_at        DateTime DEFAULT now()
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMMDD(window_start)
 ORDER BY (symbol, window_start)
 TTL toDateTime(window_start) + INTERVAL 7 DAY;
+
+CREATE TABLE IF NOT EXISTS crypto.market_alerts
+(
+    symbol String,
+    alert_type String,
+    current_volume Float64,
+    historical_avg Float64,
+    anomaly_time DateTime,
+    alert_time DateTime
+)
+ENGINE = MergeTree()
+ORDER BY (anomaly_time, symbol);

@@ -7,8 +7,9 @@ from pyflink.common import Time, Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
-from pyflink.datastream.functions import MapFunction, ProcessWindowFunction
 from pyflink.datastream.window import TumblingProcessingTimeWindows
+from pyflink.datastream.functions import MapFunction, ProcessWindowFunction, KeyedProcessFunction
+from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
 
 EMA_ALPHA = 0.3
 # trades are grouped into 30-second buckets for aggregation
@@ -43,25 +44,41 @@ WINDOW_STATS_TYPE = Types.TUPLE(
         Types.DOUBLE(),
         Types.DOUBLE(),
         Types.DOUBLE(),
-        Types.INT(),
+        Types.DOUBLE(),
         Types.INT(),
     ]
 )
 
 ENRICHED_STATS_TYPE = Types.TUPLE(
     [
-        Types.STRING(),
-        Types.LONG(),
-        Types.LONG(),
-        Types.DOUBLE(),
-        Types.DOUBLE(),
-        Types.DOUBLE(),
-        Types.DOUBLE(),
-        Types.DOUBLE(),
-        Types.DOUBLE(),
-        Types.INT(),
-        Types.DOUBLE(),
-        Types.DOUBLE(),
+        Types.STRING(),   # symbol
+        Types.LONG(),     # window_start
+        Types.LONG(),     # window_end
+        Types.DOUBLE(),   # open
+        Types.DOUBLE(),   # close
+        Types.DOUBLE(),   # high
+        Types.DOUBLE(),   # low
+        Types.DOUBLE(),   # avg_price
+        Types.DOUBLE(),   # vwap
+        Types.INT(),      # trade_count
+        Types.DOUBLE(),   # volume
+        Types.DOUBLE(),   # buy_volume
+        Types.DOUBLE(),   # sell_volume
+        Types.DOUBLE(),   # buy_sell_ratio
+        Types.DOUBLE(),   # trade_imbalance
+        Types.DOUBLE(),   # trade_frequency
+        Types.DOUBLE(),   # moving_avg
+    ]
+)
+
+ALERT_TYPE = Types.TUPLE(
+    [
+        Types.STRING(),   # symbol
+        Types.STRING(),   # alert_type
+        Types.DOUBLE(),   # current_volume
+        Types.DOUBLE(),   # historical_avg
+        Types.LONG(),     # anomaly_time
+        Types.LONG(),     # alert_time
     ]
 )
 
@@ -183,7 +200,7 @@ class TradeWindowAggregator(ProcessWindowFunction):
             )
         ]
 
-# With alpha=0.3, the EMA is: 30% current window price + 70% historical EMA.
+# With alpha=0.3, the Exponential Moving Average is: 30% current window price + 70% historical EMA.
 class MovingAverageEnricher(MapFunction):
 
     def open(self, runtime_context):
@@ -196,6 +213,55 @@ class MovingAverageEnricher(MapFunction):
         moving_avg = (EMA_ALPHA * avg_price) + ((1 - EMA_ALPHA) * previous_ema)
         self._ema_by_symbol[symbol] = moving_avg
         return (*value, moving_avg)
+    
+class StatefulVolumeDetector(KeyedProcessFunction):
+
+    def open(self, runtime_context):
+
+        descriptor = ListStateDescriptor(
+            "volume_history",
+            Types.DOUBLE()
+        )
+
+        self.volume_state = runtime_context.get_list_state(
+            descriptor
+        )
+
+    def process_element(self, value, ctx):
+
+        symbol = value[0]
+
+        current_volume = value[10]
+
+        history = list(self.volume_state.get())
+
+        if len(history) >= 3:
+
+            avg_volume = sum(history) / len(history)
+
+            if current_volume > avg_volume :
+
+                yield (
+                    symbol,
+                    "VOLUME_SPIKE",
+                    current_volume,
+                    avg_volume,
+                    value[2],  # window_end
+                    int(datetime.utcnow().timestamp() * 1000)
+                )
+
+        history.append(current_volume)
+
+        if len(history) > 10:
+            history.pop(0)
+
+        self.volume_state.update(history)
+
+        print(
+            f"Symbol={symbol}, "
+            f"Current={current_volume}, "
+            f"Avg={avg_volume}"
+        )
 
 
 class ProcessedClickHouseSink(MapFunction):
@@ -220,8 +286,8 @@ class ProcessedClickHouseSink(MapFunction):
                     value[5], #high price
                     value[6], #low price
                     value[7], #avg price
-                    value[8], #vwap
-                    value[11], #moving avg price
+                    value[8], #vwap 
+                    value[16], #moving average price
                     value[9], #trade count
                     value[10], #total volume
                     value[11], #buy volume
@@ -232,6 +298,43 @@ class ProcessedClickHouseSink(MapFunction):
                 )
             ],
         )
+        return value
+
+    def close(self):
+        self._client.disconnect()
+
+class AlertClickHouseSink(MapFunction):
+
+    def open(self, runtime_context):
+        self._client = _clickhouse_client()
+
+    def map(self, value):
+
+        self._client.execute(
+            """
+            INSERT INTO market_alerts
+            (
+                symbol,
+                alert_type,
+                current_volume,
+                historical_avg,
+                anomaly_time,
+                alert_time
+            )
+            VALUES
+            """,
+            [
+                (
+                    value[0],
+                    value[1],
+                    value[2],
+                    value[3],
+                    _ms_to_datetime(value[4]),
+                    _ms_to_datetime(value[5]),
+                )
+            ],
+        )
+
         return value
 
     def close(self):
@@ -262,14 +365,21 @@ def build_pipeline(env):
 
     trades.map(RawClickHouseSink(), output_type=TRADE_TYPE)
 
-    (
+    processed = (
         trades.key_by(lambda trade: trade[0])
         .window(TumblingProcessingTimeWindows.of(Time.seconds(WINDOW_SECONDS)))
         .process(TradeWindowAggregator(), output_type=WINDOW_STATS_TYPE)
         .map(MovingAverageEnricher(), output_type=ENRICHED_STATS_TYPE)
-        .map(ProcessedClickHouseSink(), output_type=ENRICHED_STATS_TYPE)
     )
 
+    processed.map(ProcessedClickHouseSink(),output_type=ENRICHED_STATS_TYPE)
+
+    alerts = (
+        processed.key_by(lambda x: x[0])
+        .process(StatefulVolumeDetector(),output_type=ALERT_TYPE)
+    )
+
+    alerts.map(AlertClickHouseSink(),output_type=ALERT_TYPE)
 
 def main():
     env = StreamExecutionEnvironment.get_execution_environment()
