@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS crypto.market_alerts
 (
     symbol String,
     alert_type String,
+    severity String,
     current_volume Float64,
     historical_avg Float64,
     anomaly_time DateTime,

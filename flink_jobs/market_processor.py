@@ -75,6 +75,7 @@ ALERT_TYPE = Types.TUPLE(
     [
         Types.STRING(),   # symbol
         Types.STRING(),   # alert_type
+        Types.STRING(),   # severity
         Types.DOUBLE(),   # current_volume
         Types.DOUBLE(),   # historical_avg
         Types.LONG(),     # anomaly_time
@@ -176,7 +177,13 @@ class TradeWindowAggregator(ProcessWindowFunction):
         )
         buy_sell_ratio = buy_volume / sell_volume if sell_volume > 0 else buy_volume
 
-        trade_imbalance = ( buy_volume - sell_volume) / (buy_volume + sell_volume)
+        total_volume_side = buy_volume + sell_volume
+
+        trade_imbalance = (
+            (buy_volume - sell_volume) / total_volume_side
+            if total_volume_side > 0
+            else 0
+        )
         trade_frequency = len(trades) / WINDOW_SECONDS
 
         return [
@@ -186,33 +193,51 @@ class TradeWindowAggregator(ProcessWindowFunction):
                 context.window().end,
                 prices[0],  # open & close prices in a window
                 prices[-1],
-                max(prices),
+                max(prices),  #5
                 min(prices),
                 avg_price,
                 vwap,
                 len(trades),
-                volume,
+                volume,   #10
                 buy_volume,
                 sell_volume,
                 buy_sell_ratio,
                 trade_imbalance,
-                trade_frequency,
+                trade_frequency, #15
             )
         ]
 
 # With alpha=0.3, the Exponential Moving Average is: 30% current window price + 70% historical EMA.
-class MovingAverageEnricher(MapFunction):
+class StatefulEMA(KeyedProcessFunction):
 
     def open(self, runtime_context):
-        self._ema_by_symbol = {}
 
-    def map(self, value):
-        symbol = value[0]
+        descriptor = ValueStateDescriptor(
+            "ema_state",
+            Types.DOUBLE()
+        )
+
+        self.ema_state = runtime_context.get_state(
+            descriptor
+        )
+
+    def process_element(self, value, ctx):
+
         avg_price = value[7]
-        previous_ema = self._ema_by_symbol.get(symbol, avg_price)
-        moving_avg = (EMA_ALPHA * avg_price) + ((1 - EMA_ALPHA) * previous_ema)
-        self._ema_by_symbol[symbol] = moving_avg
-        return (*value, moving_avg)
+
+        previous_ema = self.ema_state.value()
+
+        if previous_ema is None:
+            previous_ema = avg_price
+
+        moving_avg = (
+            EMA_ALPHA * avg_price
+            + (1 - EMA_ALPHA) * previous_ema
+        )
+
+        self.ema_state.update(moving_avg)
+
+        yield (*value, moving_avg)
     
 class StatefulVolumeDetector(KeyedProcessFunction):
 
@@ -228,33 +253,65 @@ class StatefulVolumeDetector(KeyedProcessFunction):
         )
 
     def process_element(self, value, ctx):
-
         symbol = value[0]
-
         current_volume = value[10]
-
+        buy_sell_ratio = value[13]
         history = list(self.volume_state.get())
+
+        avg_volume = sum(history) /len(history ) if history else 0.0  # safe default
 
         if len(history) >= 3:
 
-            avg_volume = sum(history) / len(history)
+            severity = None
 
-            if current_volume > avg_volume :
+            if current_volume > avg_volume * 5:
+                severity = "HIGH"
+
+            elif current_volume > avg_volume * 3:
+                severity = "MEDIUM"
+
+            elif current_volume > avg_volume * 1.5:
+                severity = "LOW"
+
+            if severity:
 
                 yield (
                     symbol,
                     "VOLUME_SPIKE",
+                    severity,
                     current_volume,
                     avg_volume,
-                    value[2],  # window_end
+                    value[2],
                     int(datetime.utcnow().timestamp() * 1000)
                 )
+        
+        if buy_sell_ratio > 2:
+
+            yield (
+                symbol,
+                "BUY_PRESSURE",
+                "MEDIUM",
+                current_volume,
+                avg_volume,
+                value[2],
+                int(datetime.utcnow().timestamp() * 1000)
+            )
+
+        if buy_sell_ratio < 0.5:
+
+            yield (
+                symbol,
+                "SELL_PRESSURE",
+                "MEDIUM",
+                current_volume,
+                avg_volume,
+                value[2],
+                int(datetime.utcnow().timestamp() * 1000)
+            )
 
         history.append(current_volume)
-
         if len(history) > 10:
             history.pop(0)
-
         self.volume_state.update(history)
 
         print(
@@ -262,6 +319,7 @@ class StatefulVolumeDetector(KeyedProcessFunction):
             f"Current={current_volume}, "
             f"Avg={avg_volume}"
         )
+
 
 
 class ProcessedClickHouseSink(MapFunction):
@@ -316,6 +374,7 @@ class AlertClickHouseSink(MapFunction):
             (
                 symbol,
                 alert_type,
+                severity,
                 current_volume,
                 historical_avg,
                 anomaly_time,
@@ -329,8 +388,9 @@ class AlertClickHouseSink(MapFunction):
                     value[1],
                     value[2],
                     value[3],
-                    _ms_to_datetime(value[4]),
+                    value[4],
                     _ms_to_datetime(value[5]),
+                    _ms_to_datetime(value[6]),
                 )
             ],
         )
@@ -369,7 +429,8 @@ def build_pipeline(env):
         trades.key_by(lambda trade: trade[0])
         .window(TumblingProcessingTimeWindows.of(Time.seconds(WINDOW_SECONDS)))
         .process(TradeWindowAggregator(), output_type=WINDOW_STATS_TYPE)
-        .map(MovingAverageEnricher(), output_type=ENRICHED_STATS_TYPE)
+        .key_by(lambda x: x[0])
+        .process(StatefulEMA(), output_type=ENRICHED_STATS_TYPE)
     )
 
     processed.map(ProcessedClickHouseSink(),output_type=ENRICHED_STATS_TYPE)
